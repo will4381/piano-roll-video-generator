@@ -5,27 +5,34 @@ import moviepy.editor as mpy
 from music21 import note, stream, duration
 from moviepy.video.io.bindings import mplfig_to_npimage
 import matplotlib.pyplot as plt
-from mido import Message, MidiFile, MidiTrack
+from scipy.ndimage import median_filter
 
-class PianoRollGenerator:
+class SheetMusicGenerator:
     def __init__(self, song_path, output_path):
         self.song_path = song_path
         self.output_path = output_path
         self.notes = None
         self.timings = None
         self.stream = None
-        self.piano_roll = None
-        self.piano_keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+    def note_to_midi(self, note_name):
+        return librosa.note_to_midi(note_name) if note_name is not None else None
+
+    def midi_to_note(self, midi_number):
+        return librosa.midi_to_note(midi_number) if midi_number is not None else None
 
     def analyze_audio(self):
         # Load the audio file
         y, sr = librosa.load(self.song_path)
 
-        # Perform pitch detection
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+        # Perform harmonic-percussive source separation
+        y_harmonic, y_percussive = librosa.effects.hpss(y)
+
+        # Perform pitch detection on the harmonic component
+        pitches, magnitudes = librosa.piptrack(y=y_harmonic, sr=sr)
 
         # Define a threshold for the minimum magnitude
-        threshold = np.median(magnitudes)  # Adjust this value based on your audio
+        threshold = np.median(magnitudes) * 1.5  # Adjust this value to filter more or fewer notes
 
         # Filter out the positions where the magnitude is too low
         max_magnitude_indices = magnitudes.argmax(axis=0)
@@ -46,13 +53,28 @@ class PianoRollGenerator:
             else:
                 self.notes.append(None)  # Placeholder for non-notes or rest
 
+        # Convert notes to MIDI numbers
+        midi_notes = [self.note_to_midi(note) for note in self.notes]
+
+        # Replace None values with a placeholder for the median filter
+        placeholder = -1
+        midi_notes_with_placeholder = [note if note is not None else placeholder for note in midi_notes]
+
+        # Apply a median filter to smooth out rapid note changes
+        smoothed_midi_notes = median_filter(midi_notes_with_placeholder, size=5, mode='constant', cval=placeholder)
+
+        # Replace placeholders back to None
+        smoothed_midi_notes = [note if note != placeholder else None for note in smoothed_midi_notes]
+
+        # Convert MIDI numbers back to note names
+        self.notes = [self.midi_to_note(note) for note in smoothed_midi_notes]
+
         # Get the timing of each note
         self.timings = librosa.frames_to_time(np.arange(len(self.notes)), sr=sr)
 
     def transcribe_notes(self):
         # Create a music21 stream
         self.stream = stream.Stream()
-        self.stream.quarterLength = 0.25  # Ensure it's never zero, adjust as needed
 
         # Iterate over the notes and timings
         for note_name, start_time, end_time in zip(self.notes[:-1], self.timings[:-1], self.timings[1:]):
@@ -66,46 +88,43 @@ class PianoRollGenerator:
                 current_note = note.Rest()
 
             # Calculate the note duration based on the timings
-            duration_quarter_length = (end_time - start_time) / self.stream.quarterLength
+            duration_quarter_length = max(0.25, (end_time - start_time) / 0.25)  # Ensure minimum duration of 0.25
             current_note.duration = duration.Duration(duration_quarter_length)
 
             # Add the note or rest to the stream
             self.stream.append(current_note)
 
-    def generate_piano_roll(self):
-        # Create a piano roll matrix
-        piano_roll = np.zeros((len(self.piano_keys), len(self.notes)))
+    def generate_sheet_music_image(self):
+        # Create a figure for the sheet music
+        fig, ax = plt.subplots(figsize=(10, 8))
 
-        # Fill the piano roll matrix with note velocities
-        for i, note_name in enumerate(self.notes):
-            if note_name:
-                # Get the index of the piano key for the current note
-                key_index = self.piano_keys.index(note_name.split('-')[0].split('/')[0])
-                piano_roll[key_index, i] = 1
+        # Plot the music21 stream as a matplotlib figure
+        self.stream.plot('matplotlib', ax=ax)
+        
+        # Convert the plot to a numpy array
+        sheet_music_image = mplfig_to_npimage(fig)
 
-        self.piano_roll = piano_roll
+        return fig, ax, sheet_music_image
 
     def generate_video(self, use_original_audio=True):
-        # Create a figure and axis for the piano roll plot
-        fig, ax = plt.subplots(figsize=(8, 4))
+        # Generate the sheet music image
+        fig, ax, sheet_music_image = self.generate_sheet_music_image()
 
-        # Plot the piano roll
-        piano_roll_plot = ax.imshow(self.piano_roll, cmap='binary', aspect='auto', origin='lower')
-
-        # Set the y-ticks to the piano keys
-        ax.set_yticks(range(len(self.piano_keys)))
-        ax.set_yticklabels(self.piano_keys)
-
-        # Hide the x-axis
-        ax.get_xaxis().set_visible(False)
-
-        # Function to update the plot for each frame
+        # Function to update the sheet music image for each frame
         def make_frame(t):
             # Calculate the frame index based on time
             frame_idx = int(t * len(self.notes) / self.timings[-1])
 
-            # Update the piano roll plot
-            piano_roll_plot.set_data(self.piano_roll[:, :frame_idx])
+            # Clear previous highlights
+            ax.clear()
+
+            # Re-display the sheet music image
+            ax.imshow(sheet_music_image)
+            ax.axis('off')
+
+            # Highlight the current note
+            if self.notes[frame_idx]:
+                ax.text(0.5, 0.1, self.notes[frame_idx], fontsize=24, color='red', ha='center', transform=ax.transAxes)
 
             # Convert the plot to a numpy array
             return mplfig_to_npimage(fig)
@@ -117,32 +136,8 @@ class PianoRollGenerator:
             # Use the original audio
             audio = mpy.AudioFileClip(self.song_path)
         else:
-            # Generate MIDI audio
-            midi_file = MidiFile()
-            track = MidiTrack()
-            midi_file.tracks.append(track)
-            
-            elapsed_time = 0
-            for note_name, start_time, end_time in zip(self.notes[:-1], self.timings[:-1], self.timings[1:]):
-                if note_name:
-                    # Get the MIDI note number
-                    note_number = librosa.note_to_midi(note_name)
-
-                    # Calculate delta times in ticks
-                    delta_start = mido.second2tick(start_time - elapsed_time, midi_file.ticks_per_beat, tempo)
-                    delta_end = mido.second2tick(end_time - start_time, midi_file.ticks_per_beat, tempo)
-
-                    # Create MIDI messages with delta times
-                    track.append(Message('note_on', note=note_number, velocity=100, time=int(delta_start)))
-                    track.append(Message('note_off', note=note_number, velocity=0, time=int(delta_end)))
-
-                    elapsed_time = end_time
-
-            # Save the MIDI file
-            midi_file.save('temp_midi.mid')
-
-            # Generate audio from the MIDI file
-            audio = mpy.AudioFileClip('temp_midi.mid')
+            # Generate silence (dummy audio clip if needed)
+            audio = mpy.AudioClip(lambda t: np.sin(440 * 2 * np.pi * t), duration=self.timings[-1])
 
         # Combine the video and audio
         final_clip = animation.set_audio(audio)
@@ -150,18 +145,14 @@ class PianoRollGenerator:
         # Write the final video
         final_clip.write_videofile(self.output_path, fps=24)
 
-        # Clean up temporary files
-        os.remove('temp_midi.mid')
-
     def generate_tutorial(self, use_original_audio=True):
         self.analyze_audio()
         self.transcribe_notes()
-        self.generate_piano_roll()
         self.generate_video(use_original_audio)
 
 # Example usage
 song_path = '24.mp3'
 output_path = 'video.mp4'
 
-generator = PianoRollGenerator(song_path, output_path)
+generator = SheetMusicGenerator(song_path, output_path)
 generator.generate_tutorial(use_original_audio=True)
