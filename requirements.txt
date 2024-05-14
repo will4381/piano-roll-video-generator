@@ -3,3 +3,4 @@ numpy==1.23.1
 crepe
 scipy==1.8.1
 moviepy
+pillow
